@@ -18,6 +18,10 @@ pub struct Client {
 }
 
 impl Client {
+    pub fn id(&self) -> Id {
+        self.id
+    }
+
     #[tracing::instrument(err)]
     pub async fn connect() -> Result<Self> {
         tracing::info!("connecting");
@@ -72,13 +76,15 @@ impl Client {
 
     #[tracing::instrument(skip(self), err)]
     pub async fn send<T: Serialize + std::fmt::Debug>(&self, to: Id, body: T) -> Result<()> {
-        let data = serde_json::to_string(&Message {
+        let msg = Message {
             src: self.id,
             dest: to,
             body,
-        })?;
+        };
 
-        tracing::info!(msg = data, "sending message");
+        tracing::info!(?msg, "sending msg");
+
+        let data = serde_json::to_string(&msg)?;
 
         self.inner.write_line(&data).await?;
 

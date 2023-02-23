@@ -3,7 +3,7 @@ use std::marker::PhantomData;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use crate::{
-    client::{Client, Error},
+    client::{Client, Result},
     messages::{Id, Message, MsgId},
 };
 
@@ -11,7 +11,7 @@ pub fn from_client<T>(client: Client) -> Workload<T> {
     Workload::new(client)
 }
 
-pub async fn new<T>() -> Result<Workload<T>, Error> {
+pub async fn new<T>() -> Result<Workload<T>> {
     Client::connect().await.map(from_client)
 }
 
@@ -34,7 +34,7 @@ impl<T> Workload<T>
 where
     T: std::fmt::Debug + Serialize + DeserializeOwned,
 {
-    pub async fn recv(&self) -> Result<Option<Request<T>>, Error> {
+    pub async fn recv(&self) -> Result<Option<Request<T>>> {
         let request = self
             .client
             .recv()
@@ -66,7 +66,7 @@ impl<'de, T> Request<T>
 where
     T: std::fmt::Debug + Serialize + Deserialize<'de>,
 {
-    pub async fn echo(self) -> Result<(), Error> {
+    pub async fn echo(self) -> Result<()> {
         self.client
             .send(
                 self.from,
