@@ -1,0 +1,13 @@
+[package]
+name = "echo"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+async-trait = "0.1.64"
+maelstrom = { path = "../maelstrom" }
+serde_json = "1.0.93"
+tokio = { version = "1.25.0", features = ["full"] }
+tracing-subscriber = { version = "0.3.16", features = ["json", "env-filter"] }
