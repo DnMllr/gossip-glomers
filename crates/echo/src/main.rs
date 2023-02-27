@@ -7,12 +7,8 @@ async fn main() -> client::Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    let workload = echo::new().await?;
+    let workload = echo::new::<serde_json::Value>().await?;
 
-    run_workload(workload).await
-}
-
-async fn run_workload(workload: echo::Workload<serde_json::Value>) -> client::Result<()> {
     while let Some(msg) = workload.recv().await? {
         msg.echo().await?;
     }
