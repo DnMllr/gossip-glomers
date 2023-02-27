@@ -22,6 +22,10 @@ impl Client {
         self.id
     }
 
+    pub fn nodes(&self) -> &[Id] {
+        &self.nodes
+    }
+
     #[tracing::instrument(err)]
     pub async fn connect() -> Result<Self> {
         tracing::info!("connecting");
@@ -68,9 +72,17 @@ impl Client {
         Ok(if amount_read == 0 {
             None
         } else {
-            let value = serde_json::from_str(&buf)?;
-            tracing::info!(msg = ?value, "received msg");
-            Some(value)
+            let result = serde_json::from_str(&buf);
+            match result {
+                Ok(value) => {
+                    tracing::info!(msg = ?value, "received msg");
+                    Some(value)
+                }
+                Err(e) => {
+                    tracing::error!(err = ?e, string = buf, "received invalid json");
+                    return Err(Error::Json(e));
+                }
+            }
         })
     }
 

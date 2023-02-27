@@ -25,6 +25,14 @@ impl Workload {
         Self { client }
     }
 
+    pub fn nodes(&self) -> &[Id] {
+        self.client.nodes()
+    }
+
+    pub fn node_id(&self) -> Id {
+        self.client.id()
+    }
+
     pub async fn recv<T>(&self) -> Result<Option<Request<T>>>
     where
         T: DeserializeOwned + std::fmt::Debug,
@@ -35,7 +43,7 @@ impl Workload {
             .map(|maybe_msg| maybe_msg.map(|msg| self.handle_msg(msg)))
     }
 
-    pub fn handle_msg<T>(&self, msg: Message<RequestBody<T>>) -> Request<T> {
+    fn handle_msg<T>(&self, msg: Message<RequestBody<T>>) -> Request<T> {
         match msg.body {
             RequestBody::Topology { topology, msg_id } => Request::Topology(TopologyRequest {
                 client: self.client.clone(),
@@ -54,7 +62,38 @@ impl Workload {
                 from: msg.src,
                 msg_id,
             }),
+            RequestBody::BroadcastOk { in_reply_to, .. } => Request::Ack(in_reply_to),
         }
+    }
+
+    pub async fn send<T>(&self, to: Id, message: T) -> Result<MsgId>
+    where
+        T: Serialize + std::fmt::Debug,
+    {
+        let id = MsgId::next();
+
+        self.client
+            .send(
+                to,
+                RequestBody::Broadcast {
+                    message,
+                    msg_id: id,
+                },
+            )
+            .await?;
+
+        Ok(id)
+    }
+
+    pub async fn retry<T>(&self, msg_id: MsgId, to: Id, message: T) -> Result<()>
+    where
+        T: Serialize + std::fmt::Debug,
+    {
+        self.client
+            .send(to, RequestBody::Broadcast { message, msg_id })
+            .await?;
+
+        Ok(())
     }
 }
 
@@ -63,6 +102,7 @@ pub enum Request<T> {
     Read(ReadRequest),
     Broadcast(BroadcastRequest<T>),
     Topology(TopologyRequest),
+    Ack(MsgId),
 }
 
 #[derive(Debug)]
@@ -81,9 +121,9 @@ impl ReadRequest {
             .send(
                 self.from,
                 ResponseBody::ReadOk {
-                    messages,
                     msg_id: MsgId::next(),
                     in_reply_to: self.msg_id,
+                    messages,
                 },
             )
             .await
@@ -104,6 +144,10 @@ where
 {
     pub fn message(&self) -> &T {
         &self.message
+    }
+
+    pub fn from(&self) -> &Id {
+        &self.from
     }
 
     pub async fn reply(&self) -> Result<()> {
@@ -132,6 +176,10 @@ impl TopologyRequest {
         &self.topology
     }
 
+    pub fn neighbors(&self) -> Option<&HashSet<Id>> {
+        self.topology.get(&self.client.id())
+    }
+
     pub async fn reply(&self) -> Result<()> {
         self.client
             .send(
@@ -145,7 +193,7 @@ impl TopologyRequest {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RequestBody<T> {
     Topology {
@@ -158,6 +206,11 @@ pub enum RequestBody<T> {
     },
     Read {
         msg_id: MsgId,
+    },
+    // Other nodes could be ack-ing our gossip
+    BroadcastOk {
+        msg_id: MsgId,
+        in_reply_to: MsgId,
     },
 }
 
