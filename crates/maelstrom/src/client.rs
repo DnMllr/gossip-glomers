@@ -12,12 +12,45 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug, Clone)]
 pub struct Client {
-    inner: Arc<Services>,
-    nodes: Arc<Vec<Id>>,
-    id: Id,
+    inner: Arc<InnerClient>,
 }
 
 impl Client {
+    pub async fn connect() -> Result<Self> {
+        InnerClient::connect()
+            .await
+            .map(Arc::new)
+            .map(|inner| Self { inner })
+    }
+
+    pub async fn recv<T>(&self) -> Result<Option<T>>
+    where
+        T: std::fmt::Debug + DeserializeOwned,
+    {
+        self.inner.recv().await
+    }
+
+    pub async fn send<T: Serialize + std::fmt::Debug>(&self, to: Id, body: T) -> Result<()> {
+        self.inner.send(to, body).await
+    }
+
+    pub fn id(&self) -> Id {
+        self.inner.id()
+    }
+
+    pub fn nodes(&self) -> &[Id] {
+        self.inner.nodes()
+    }
+}
+
+#[derive(Debug)]
+pub struct InnerClient {
+    services: Services,
+    nodes: Vec<Id>,
+    id: Id,
+}
+
+impl InnerClient {
     pub fn id(&self) -> Id {
         self.id
     }
@@ -57,8 +90,8 @@ impl Client {
     fn from_init(msg: Message<Init>, services: Services) -> Self {
         Self {
             id: msg.body.node_id,
-            nodes: Arc::new(msg.body.node_ids),
-            inner: Arc::new(services),
+            nodes: msg.body.node_ids,
+            services,
         }
     }
 
@@ -68,7 +101,7 @@ impl Client {
         T: std::fmt::Debug + DeserializeOwned,
     {
         let mut buf = String::with_capacity(64);
-        let amount_read = self.inner.read_line(&mut buf).await?;
+        let amount_read = self.services.read_line(&mut buf).await?;
         Ok(if amount_read == 0 {
             None
         } else {
@@ -98,7 +131,7 @@ impl Client {
 
         let data = serde_json::to_string(&msg)?;
 
-        self.inner.write_line(&data).await?;
+        self.services.write_line(&data).await?;
 
         Ok(())
     }

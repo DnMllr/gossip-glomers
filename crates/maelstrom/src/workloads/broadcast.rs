@@ -15,7 +15,7 @@ pub async fn new() -> Result<Workload> {
     Client::connect().await.map(from_client)
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Workload {
     client: Client,
 }
@@ -62,7 +62,18 @@ impl Workload {
                 from: msg.src,
                 msg_id,
             }),
-            RequestBody::BroadcastOk { in_reply_to, .. } => Request::Ack(in_reply_to),
+            RequestBody::BroadcastAll { messages, msg_id } => Request::BroadcastAll(Sync {
+                from: msg.src,
+                client: self.client.clone(),
+                msg_id,
+                messages,
+            }),
+            RequestBody::BroadcastOk { in_reply_to, .. } => Request::BroadcastOk(in_reply_to),
+            RequestBody::BroadcastAllOk {
+                in_reply_to,
+                messages,
+                ..
+            } => Request::BroadcastAllOk(in_reply_to, msg.src, messages),
         }
     }
 
@@ -85,24 +96,69 @@ impl Workload {
         Ok(id)
     }
 
-    pub async fn retry<T>(&self, msg_id: MsgId, to: Id, message: T) -> Result<()>
+    pub async fn send_all<T>(&self, target: Id, messages: Vec<T>) -> Result<MsgId>
     where
         T: Serialize + std::fmt::Debug,
     {
+        let id = MsgId::next();
         self.client
-            .send(to, RequestBody::Broadcast { message, msg_id })
+            .send(
+                target,
+                RequestBody::BroadcastAll {
+                    msg_id: id,
+                    messages,
+                },
+            )
             .await?;
 
-        Ok(())
+        Ok(id)
     }
 }
 
 #[derive(Debug)]
 pub enum Request<T> {
     Read(ReadRequest),
+    BroadcastAll(Sync<T>),
     Broadcast(BroadcastRequest<T>),
     Topology(TopologyRequest),
-    Ack(MsgId),
+    BroadcastOk(MsgId),
+    BroadcastAllOk(MsgId, Id, Vec<T>),
+}
+
+#[derive(Debug)]
+pub struct Sync<T> {
+    messages: Vec<T>,
+    msg_id: MsgId,
+    from: Id,
+    client: Client,
+}
+
+impl<T> Sync<T> {
+    pub fn messages(&self) -> &[T] {
+        &self.messages
+    }
+
+    pub fn from(&self) -> &Id {
+        &self.from
+    }
+}
+
+impl<T> Sync<T>
+where
+    T: Serialize + std::fmt::Debug,
+{
+    pub async fn reply(&self, messages: &[T]) -> Result<()> {
+        self.client
+            .send(
+                self.from,
+                ResponseBody::BroadcastAllOk {
+                    in_reply_to: self.msg_id,
+                    msg_id: MsgId::next(),
+                    messages,
+                },
+            )
+            .await
+    }
 }
 
 #[derive(Debug)]
@@ -180,6 +236,15 @@ impl TopologyRequest {
         self.topology.get(&self.client.id())
     }
 
+    pub async fn into_neighbors(mut self) -> Result<HashSet<Id>> {
+        let result = self
+            .topology
+            .remove(&self.client.id())
+            .expect("topology must have been set");
+        self.reply().await?;
+        Ok(result)
+    }
+
     pub async fn reply(&self) -> Result<()> {
         self.client
             .send(
@@ -207,9 +272,17 @@ pub enum RequestBody<T> {
     Read {
         msg_id: MsgId,
     },
-    // Other nodes could be ack-ing our gossip
+    BroadcastAll {
+        messages: Vec<T>,
+        msg_id: MsgId,
+    },
     BroadcastOk {
         msg_id: MsgId,
+        in_reply_to: MsgId,
+    },
+    BroadcastAllOk {
+        msg_id: MsgId,
+        messages: Vec<T>,
         in_reply_to: MsgId,
     },
 }
@@ -223,6 +296,11 @@ pub enum ResponseBody<'a, T> {
     },
     BroadcastOk {
         msg_id: MsgId,
+        in_reply_to: MsgId,
+    },
+    BroadcastAllOk {
+        msg_id: MsgId,
+        messages: &'a [T],
         in_reply_to: MsgId,
     },
     ReadOk {

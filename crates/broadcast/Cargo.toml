@@ -8,8 +8,13 @@ edition = "2021"
 [dependencies]
 dashmap = "5.4.0"
 futures = "0.3.26"
+fxhash = "0.2.1"
 maelstrom = { path = "../maelstrom" }
+rand = "0.8.5"
 serde = "1.0.152"
 tokio = { version = "1.25.0", features = ["full"] }
 tracing = "0.1.37"
 tracing-subscriber = { version = "0.3.16", features = ["json", "env-filter"] }
+
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = "0.5"

@@ -15,6 +15,14 @@ broadcast-step-2: build
 broadcast-step-3: build
   (cd ./maelstrom && ./maelstrom test -w broadcast --bin ../target/release/broadcast --node-count 5 --time-limit 20 --rate 10 --nemesis partition --log-stderr)
 
+broadcast-step-4: build
+  (cd ./maelstrom && ./maelstrom test -w broadcast --bin ../target/release/broadcast --node-count 25 --time-limit 20 --rate 100 --latency 100 --log-stderr)
+
+broadcast-step-4-partition: build
+  (cd ./maelstrom && ./maelstrom test -w broadcast --bin ../target/release/broadcast --node-count 25 --time-limit 20 --rate 100 --latency 100 --nemesis partition --log-stderr)
+
+
+
 build:
   cargo build --release
 
