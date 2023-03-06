@@ -87,7 +87,8 @@ impl InnerClient {
         Ok(client)
     }
 
-    fn from_init(msg: Message<Init>, services: Services) -> Self {
+    fn from_init(mut msg: Message<Init>, services: Services) -> Self {
+        msg.body.node_ids.sort();
         Self {
             id: msg.body.node_id,
             nodes: msg.body.node_ids,
