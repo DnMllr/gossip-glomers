@@ -147,17 +147,20 @@ impl<T> Sync<T>
 where
     T: Serialize + std::fmt::Debug,
 {
-    pub async fn reply(&self, messages: &[T]) -> Result<()> {
+    pub async fn reply(&self, messages: &[T]) -> Result<MsgId> {
+        let msg_id = MsgId::next();
         self.client
             .send(
                 self.from,
                 ResponseBody::BroadcastAllOk {
                     in_reply_to: self.msg_id,
-                    msg_id: MsgId::next(),
+                    msg_id,
                     messages,
                 },
             )
-            .await
+            .await?;
+
+        Ok(msg_id)
     }
 }
 

@@ -10,7 +10,9 @@ use futures::{stream::FuturesUnordered, TryStreamExt};
 use maelstrom::{
     client,
     messages::{Id, MsgId},
-    workloads::broadcast::{self, Request, Workload},
+    workloads::broadcast::{
+        self, BroadcastRequest, ReadRequest, Request, Sync, TopologyRequest, Workload,
+    },
 };
 use tokio::{sync::mpsc, time::Instant};
 use tracing_subscriber::EnvFilter;
@@ -39,7 +41,9 @@ static GLOBAL: Jemalloc = Jemalloc;
 //                    0.99 636,
 //                    1 678},
 //
-// Which meets requirements. It's also resiliant to partition (though that resiliancy could be improved).
+// Which meets requirements. It's also resiliant to `nemesis --partition` (though that resiliancy could be improved by moving the broadcaster role to a
+// non partitioned node if the broadcaster has gotten partitioned).
+//
 
 const BROADCASTER_HEARTBEAT: Duration = Duration::from_millis(500);
 const FORWARDER_HEARTBEAT: Duration = Duration::from_millis(100);
@@ -77,19 +81,16 @@ async fn main() -> client::Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Default)]
 struct State {
-    remotes: DashMap<Id, HashSet<i32, fxhash::FxBuildHasher>, fxhash::FxBuildHasher>,
-    messages: DashSet<i32, fxhash::FxBuildHasher>,
+    remotes: Remotes,
+    messages: Messages,
     pending: PendingMessages,
 }
 
 impl State {
     fn new() -> Self {
-        Self {
-            messages: DashSet::with_hasher(fxhash::FxBuildHasher::default()),
-            remotes: DashMap::with_hasher(fxhash::FxBuildHasher::default()),
-            pending: PendingMessages::new(),
-        }
+        Default::default()
     }
 
     #[tracing::instrument(skip(self, req, workload, _channel), fields(n = %workload.node_id()), err)]
@@ -106,85 +107,109 @@ impl State {
 
             Request::BroadcastAllOk(msg_id, id, messages) => {
                 self.ack_msg(msg_id);
-                let mut futures = FuturesUnordered::new();
-                for msg in messages {
-                    if self.messages.insert(msg) {
-                        futures.push(self.new_msg(&id, msg, &workload));
-                    }
-                }
-
-                while (futures.try_next().await?).is_some() {}
+                self.on_broadcast_all_ack(id, messages, &workload).await?;
             }
 
             Request::Read(read) => {
-                let mut v = self.messages.iter().map(|v| *v).collect::<Vec<i32>>();
-                v.sort();
-                read.reply(v.as_slice()).await?;
+                self.on_read(read).await?;
             }
 
             Request::Broadcast(b) => {
-                let mut futures = FuturesUnordered::new();
-                if self.messages.insert(*b.message()) {
-                    tracing::info!(msg = *b.message(), "saw new message");
-                    futures.push(self.new_msg(b.from(), *b.message(), &workload));
-                }
-
-                tokio::try_join!(b.reply(), async move {
-                    while (futures.try_next().await?).is_some() {}
-                    Ok(())
-                })?;
+                self.on_broadcast(b, &workload).await?;
             }
 
             Request::Topology(topology) => {
-                topology.reply().await?;
+                self.on_topology(topology).await?;
             }
 
             Request::BroadcastAll(sync) => {
-                tracing::info!(msgs = ?sync.messages(), "saw broadcast all with messages");
-                let mut futures = FuturesUnordered::new();
-                for msg in sync.messages() {
-                    if self.messages.insert(*msg) {
-                        futures.push(self.new_msg(sync.from(), *msg, &workload));
-                    }
-                }
-                let msgs = self
-                    .new_messages_mut(*sync.from())
-                    .drain()
-                    .collect::<Vec<i32>>();
-
-                tokio::try_join!(sync.reply(&msgs), async move {
-                    while (futures.try_next().await?).is_some() {}
-                    Ok(())
-                })?;
+                self.on_sync(sync, &workload).await?;
             }
         }
 
         Ok(())
     }
 
-    fn broadcaster(workload: &Workload) -> Id {
-        workload
-            .nodes()
-            .iter()
-            .min()
-            .copied()
-            .unwrap_or(workload.node_id())
+    async fn on_broadcast(
+        &self,
+        b: BroadcastRequest<i32>,
+        workload: &Workload,
+    ) -> client::Result<()> {
+        if self.messages.add(*b.message()) {
+            tracing::info!(msg = *b.message(), "saw new message");
+            tokio::try_join!(b.reply(), self.new_msg(b.from(), *b.message(), workload))?;
+        } else {
+            b.reply().await?;
+        }
+
+        Ok(())
     }
 
-    fn i_am_broadcaster(workload: &Workload) -> bool {
-        workload.node_id() == Self::broadcaster(workload)
+    async fn on_broadcast_all_ack(
+        &self,
+        from: Id,
+        messages: Vec<i32>,
+        workload: &Workload,
+    ) -> client::Result<()> {
+        self.new_messages(&from, messages.into_iter(), workload)
+            .await
     }
 
-    fn node_is_broadcaster(from: &Id, workload: &Workload) -> bool {
-        from == &Self::broadcaster(workload)
+    async fn on_sync(&self, sync: Sync<i32>, workload: &Workload) -> client::Result<()> {
+        tracing::info!(msgs = ?sync.messages(), "saw broadcast all with messages");
+
+        let msgs = self.remotes.get_mut(*sync.from()).drain_to_vec();
+
+        let reply_fut = async {
+            let msg_id = sync.reply(&msgs).await?;
+
+            self.pending.set(
+                msg_id,
+                PendingMessage::new(*sync.from(), msgs.into_iter().collect()),
+            );
+
+            client::Result::Ok(())
+        };
+
+        let send_fut = self.new_messages(sync.from(), sync.messages().iter().copied(), workload);
+
+        tokio::try_join!(reply_fut, send_fut)?;
+
+        Ok(())
+    }
+
+    async fn new_messages<I: Iterator<Item = i32>>(
+        &self,
+        from: &Id,
+        messages: I,
+        workload: &Workload,
+    ) -> client::Result<()> {
+        let mut futures = FuturesUnordered::new();
+        for msg in messages {
+            if self.messages.add(msg) {
+                futures.push(self.new_msg(from, msg, workload));
+            }
+        }
+
+        while (futures.try_next().await?).is_some() {}
+
+        Ok(())
+    }
+
+    async fn on_read(&self, read: ReadRequest) -> client::Result<()> {
+        self.messages.send(read).await
+    }
+
+    async fn on_topology(&self, topology: TopologyRequest) -> client::Result<()> {
+        topology.reply().await
     }
 
     async fn new_msg(&self, from: &Id, msg: i32, workload: &Workload) -> client::Result<()> {
-        if Self::node_is_broadcaster(from, workload) {
+        if node_is_broadcaster(from, workload) {
             return Ok(());
         }
 
-        if Self::i_am_broadcaster(workload) {
+        if i_am_broadcaster(workload) {
             self.broadcast(from, msg, workload).await
         } else {
             self.forward_to_broadcaster(msg, workload).await
@@ -196,8 +221,8 @@ impl State {
         let mut futures = FuturesUnordered::new();
         for node in nodes {
             if node != &workload.node_id() && node != from {
-                let mut remote = self.new_messages_mut(*node);
-                remote.insert(msg);
+                let mut remote = self.remotes.get_mut(*node);
+                remote.add(msg);
                 if remote.len() > MAX_MSGS {
                     futures.push(self.sync_node(*node, workload));
                 }
@@ -210,9 +235,9 @@ impl State {
     }
 
     async fn forward_to_broadcaster(&self, msg: i32, workload: &Workload) -> client::Result<()> {
-        let broadcaster = &Self::broadcaster(workload);
-        let mut remote = self.new_messages_mut(*broadcaster);
-        remote.insert(msg);
+        let broadcaster = &broadcaster(workload);
+        let mut remote = self.remotes.get_mut(*broadcaster);
+        remote.add(msg);
         if remote.len() > MAX_MSGS {
             self.sync_node(*broadcaster, workload).await?;
         }
@@ -220,18 +245,9 @@ impl State {
         Ok(())
     }
 
-    fn new_messages_mut(
-        &self,
-        id: Id,
-    ) -> RefMut<Id, HashSet<i32, fxhash::FxBuildHasher>, fxhash::FxBuildHasher> {
-        self.remotes
-            .entry(id)
-            .or_insert_with(fxhash::FxHashSet::default)
-    }
-
     async fn spawn_sync(&self, workload: Workload) -> client::Result<()> {
         loop {
-            if Self::i_am_broadcaster(&workload) {
+            if i_am_broadcaster(&workload) {
                 tokio::time::sleep(BROADCASTER_HEARTBEAT).await;
             } else {
                 tokio::time::sleep(FORWARDER_HEARTBEAT).await;
@@ -276,8 +292,7 @@ impl State {
     }
 
     async fn sync_node(&self, node: Id, workload: &Workload) -> client::Result<()> {
-        let set: HashSet<i32, fxhash::FxBuildHasher> =
-            self.new_messages_mut(node).drain().collect();
+        let set = self.remotes.get_mut(node).take();
 
         if !set.is_empty() {
             tracing::info!(diff = ?set, target = %node, "syncing diff");
@@ -294,13 +309,70 @@ impl State {
     fn ack_msg(&self, msg_id: MsgId) {
         if let Some(p) = self.pending.ack(msg_id) {
             for msg in p.messages {
-                self.new_messages_mut(p.to).remove(&msg);
+                self.remotes.get_mut(p.to).remove(&msg);
             }
         }
     }
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
+struct Messages {
+    data: DashSet<i32, fxhash::FxBuildHasher>,
+}
+
+impl Messages {
+    pub fn add(&self, msg: i32) -> bool {
+        self.data.insert(msg)
+    }
+
+    async fn send(&self, reply: ReadRequest) -> client::Result<()> {
+        let mut v = self.data.iter().map(|v| *v).collect::<Vec<i32>>();
+        v.sort();
+        reply.reply(v.as_slice()).await
+    }
+}
+
+#[derive(Debug, Default)]
+struct Remotes {
+    remotes: DashMap<Id, Remote, fxhash::FxBuildHasher>,
+}
+
+impl Remotes {
+    pub fn get_mut(&self, id: Id) -> RefMut<Id, Remote, fxhash::FxBuildHasher> {
+        self.remotes.entry(id).or_default()
+    }
+}
+
+#[derive(Debug, Default)]
+struct Remote {
+    data: HashSet<i32, fxhash::FxBuildHasher>,
+}
+
+impl Remote {
+    pub fn add(&mut self, msg: i32) -> bool {
+        self.data.insert(msg)
+    }
+
+    pub fn remove(&mut self, msg: &i32) -> bool {
+        self.data.remove(msg)
+    }
+
+    pub fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    pub fn drain_to_vec(&mut self) -> Vec<i32> {
+        let mut data: Vec<i32> = self.data.drain().collect();
+        data.sort();
+        data
+    }
+
+    pub fn take(&mut self) -> HashSet<i32, fxhash::FxBuildHasher> {
+        std::mem::take(&mut self.data)
+    }
+}
+
+#[derive(Debug, Default)]
 pub struct PendingMessages {
     messages: DashMap<MsgId, PendingMessage>,
 }
@@ -341,6 +413,7 @@ impl PendingMessages {
     }
 }
 
+#[derive(Debug)]
 pub struct PendingMessage {
     pub to: Id,
     pub messages: HashSet<i32, fxhash::FxBuildHasher>,
@@ -357,4 +430,21 @@ impl PendingMessage {
             retried: false,
         }
     }
+}
+
+fn i_am_broadcaster(workload: &Workload) -> bool {
+    workload.node_id() == broadcaster(workload)
+}
+
+fn node_is_broadcaster(from: &Id, workload: &Workload) -> bool {
+    from == &broadcaster(workload)
+}
+
+fn broadcaster(workload: &Workload) -> Id {
+    workload
+        .nodes()
+        .iter()
+        .min()
+        .copied()
+        .unwrap_or(workload.node_id())
 }
